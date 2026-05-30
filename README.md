@@ -130,12 +130,7 @@ output_file = "ai_internships_lahore.csv"
 
 ---
 
-## 👨‍💻 Authors
-
-**M. Talha Farooqi**
-- *Final Year BS Software Engineering Student*
-- *University of Management and Technology, Lahore*
-
+## 👨‍💻 Author
 **Husnain Aslam**
 - *Final Year BS Software Engineering Student*
 - *University of Management and Technology, Lahore*
