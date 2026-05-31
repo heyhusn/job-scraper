@@ -98,12 +98,7 @@ Before running the scraper, ensure you have the following installed:
 
 ---
 
-## 👨‍💻 Authors
-
-**M. Talha Farooqi**
-- *Final Year BS Software Engineering Student*
-- *University of Management and Technology, Lahore*
-
+## 👨‍💻 Author
 **Husnain Aslam**
 - *Final Year BS Software Engineering Student*
 - *University of Management and Technology, Lahore*
