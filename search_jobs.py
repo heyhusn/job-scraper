@@ -1,182 +1,315 @@
+"""
+search_jobs.py — Smart Job Scraper v3.0
+=======================================
+Interactive multi-source job scraper with intelligent relevance filtering.
+
+Workflow:
+  1. Ask the user for: position, brief description, city, work type
+  2. Generate smart search queries via keyword engine
+  3. Scrape 8+ sources (JobSpy boards + 4 free APIs) — last 48 hours only
+  4. Score and filter for relevance
+  5. Export a clean, high-quality CSV
+"""
+
 import csv
-import requests
-import pandas as pd
+import sys
+import os
+import re
+import io
 from datetime import datetime
+
+# Fix Windows console encoding
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+import pandas as pd
+
+# Add current dir to path so our modules are importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from jobspy import scrape_jobs
+from keyword_engine import build_keyword_plan
+from sources import fetch_all_api_jobs
+from relevance import filter_jobs
 
-# -------------------------------------------------------------
-# HELPER FUNCTIONS TO SCRAPE TOTALLY FREE, HIGH-QUALITY APIs
-# -------------------------------------------------------------
 
-def fetch_himalayas_jobs(query):
+# ─────────────────────────────────────────────────────────────
+# Pretty console helpers
+# ─────────────────────────────────────────────────────────────
+
+def _header(text: str):
+    width = 70
+    print()
+    print("=" * width)
+    print(f"  {text}".center(width))
+    print("=" * width)
+
+
+def _section(num: int, text: str):
+    print(f"\n{'-'*50}")
+    print(f"  [{num}] {text}")
+    print(f"{'-'*50}")
+
+
+# ─────────────────────────────────────────────────────────────
+# User input
+# ─────────────────────────────────────────────────────────────
+
+def get_user_input() -> dict:
+    """Interactively collect job search parameters from the user."""
+    _header("Smart Job Scraper v3.0")
+    print()
+
+    # Position
+    position = input("  [POSITION] Enter the position you're looking for:\n     > ").strip()
+    if not position:
+        position = "AI/ML Internship"
+        print(f"     (defaulting to: {position})")
+    print()
+
+    # Brief description
+    print("  [DESCRIPTION] Briefly describe the kind of role you want")
+    print("     (skills, tech, domain - helps us find better matches):")
+    description = input("     > ").strip()
+    print()
+
+    # City
+    city = input("  [CITY] Preferred city (leave blank for any/worldwide):\n     > ").strip()
+    print()
+
+    # Work type
+    print("  [WORK TYPE]")
+    print("     1. Remote")
+    print("     2. Onsite")
+    print("     3. Hybrid")
+    print("     4. Any (all types)")
+    work_choice = input("     > Choose [1-4]: ").strip()
+    work_type_map = {"1": "remote", "2": "onsite", "3": "hybrid", "4": "any"}
+    work_type = work_type_map.get(work_choice, "any")
+    print(f"     (selected: {work_type})")
+    print()
+
+    return {
+        "position": position,
+        "description": description,
+        "city": city,
+        "work_type": work_type,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# JobSpy scraping (Indeed, LinkedIn, Google, Glassdoor)
+# ─────────────────────────────────────────────────────────────
+
+def scrape_jobspy_boards(queries: list[str], city: str, work_type: str, hours_old: int = 48) -> list[dict]:
     """
-    Fetches remote jobs from Himalayas (a completely free, no-key public API)
+    Scrape standard job boards via JobSpy with multiple query terms.
+    Returns standardised list of job dicts.
     """
-    url = f"https://himalayas.app/jobs/api/search?q={query}"
-    print(f"-> Querying Himalayas API for '{query}'...")
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            jobs = data.get("jobs", [])
-            parsed_jobs = []
-            for j in jobs:
-                # Parse pubDate (epoch to YYYY-MM-DD)
-                pub_date = datetime.fromtimestamp(j["pubDate"]).strftime("%Y-%m-%d") if j.get("pubDate") else ""
-                
-                # Check location restrictions (to ensure it's open globally or to Pakistan/Worldwide)
-                locs = j.get("locationRestrictions", [])
-                location_str = ", ".join(locs) if locs else "Remote (Worldwide)"
-                
-                # Filter out jobs that specifically block international candidates if necessary
-                # If they say Remote (Worldwide) or allow Pakistan/Asia
-                parsed_jobs.append({
-                    "site": "himalayas",
-                    "title": j.get("title"),
-                    "company": j.get("companyName"),
-                    "location": location_str,
-                    "date_posted": pub_date,
-                    "job_url": j.get("applicationLink"),
-                    "is_remote": True
+    all_results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    # Determine location and country for JobSpy
+    location = city if city else None
+    # Detect country from city name for Indeed
+    country_indeed = "Pakistan"  # default
+    pk_cities = {"lahore", "karachi", "islamabad", "rawalpindi", "peshawar", "faisalabad", "multan"}
+    us_cities = {"new york", "san francisco", "austin", "seattle", "chicago", "boston", "los angeles"}
+    uk_cities = {"london", "manchester", "cambridge", "oxford"}
+    ca_cities = {"toronto", "vancouver", "montreal", "ottawa"}
+
+    city_lower = city.lower() if city else ""
+    if city_lower in pk_cities:
+        country_indeed = "Pakistan"
+    elif city_lower in us_cities:
+        country_indeed = "USA"
+    elif city_lower in uk_cities:
+        country_indeed = "UK"
+    elif city_lower in ca_cities:
+        country_indeed = "Canada"
+    elif not city:
+        country_indeed = "USA"  # broader default for remote searches
+
+    is_remote = work_type == "remote"
+
+    # Use top 4 most targeted queries for JobSpy (it's slower per query)
+    jobspy_queries = queries[:4]
+    sites = ["indeed", "linkedin", "google", "glassdoor"]
+
+    for i, query in enumerate(jobspy_queries):
+        print(f"  > JobSpy query {i+1}/{len(jobspy_queries)}: \"{query}\"")
+        try:
+            df = scrape_jobs(
+                site_name=sites,
+                search_term=query,
+                location=location,
+                country_indeed=country_indeed,
+                is_remote=is_remote,
+                results_wanted=25,
+                hours_old=hours_old,
+            )
+            if df.empty:
+                print(f"    (no results)")
+                continue
+
+            for _, row in df.iterrows():
+                job_url = str(row.get("job_url", ""))
+                if job_url in seen_urls or not job_url:
+                    continue
+                seen_urls.add(job_url)
+
+                all_results.append({
+                    "site": str(row.get("site", "jobspy")),
+                    "title": str(row.get("title", "")),
+                    "company": str(row.get("company", "")),
+                    "location": str(row.get("location", city or "")),
+                    "date_posted": str(row.get("date_posted", "")),
+                    "job_url": job_url,
+                    "description": str(row.get("description", "")),
+                    "is_remote": bool(row.get("is_remote", False)),
                 })
-            print(f"   [Himalayas] Found {len(parsed_jobs)} remote jobs.")
-            return parsed_jobs
-    except Exception as e:
-        print(f"   [Himalayas Error] Could not fetch: {e}")
-    return []
 
-def fetch_remotive_jobs(query):
-    """
-    Fetches remote jobs from Remotive (a completely free, no-key public API)
-    """
-    url = f"https://remotive.com/api/remote-jobs?search={query}"
-    print(f"-> Querying Remotive API for '{query}'...")
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            jobs = data.get("jobs", [])
-            parsed_jobs = []
-            for j in jobs:
-                pub_date = j.get("publication_date", "").split("T")[0] if "publication_date" in j else ""
-                location_str = j.get("candidate_required_location", "Remote (Worldwide)")
-                
-                parsed_jobs.append({
-                    "site": "remotive",
-                    "title": j.get("title"),
-                    "company": j.get("company_name"),
-                    "location": location_str,
-                    "date_posted": pub_date,
-                    "job_url": j.get("url"),
-                    "is_remote": True
-                })
-            print(f"   [Remotive] Found {len(parsed_jobs)} remote jobs.")
-            return parsed_jobs
-    except Exception as e:
-        print(f"   [Remotive Error] Could not fetch: {e}")
-    return []
+            print(f"    [{len(df)} raw results from boards]")
+        except Exception as e:
+            print(f"    [JobSpy Error] {e}")
 
-# -------------------------------------------------------------
-# MAIN MULTI-SOURCE SCRAPER EXECUTION
-# -------------------------------------------------------------
+    print(f"  > JobSpy total: {len(all_results)} unique jobs")
+    return all_results
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
 
 def main():
-    print("=========================================================================")
-    print("            Pakistan & Remote AI/ML Job Scraper v2.0 (Multi-API)        ")
-    print("=========================================================================")
-    
-    # Define local job board scrape criteria
-    local_search_term = '("AI" OR "ML" OR "Machine Learning" OR "Artificial Intelligence") intern'
-    location = "Lahore"
-    
-    # 1. Scrape standard job boards via JobSpy (Indeed, LinkedIn, Google)
-    print(f"\n1. Scraping local job boards (Indeed, LinkedIn, Google) for: {local_search_term} in {location}...")
-    try:
-        local_jobs_df = scrape_jobs(
-            site_name=["indeed", "linkedin", "google"], 
-            search_term=local_search_term,
-            location=location,
-            country_indeed='Pakistan',
-            results_wanted=30
-        )
-        print(f"   Local boards returned {len(local_jobs_df)} raw results.")
-    except Exception as e:
-        print(f"   [Local Scraper Error] {e}")
-        local_jobs_df = pd.DataFrame()
+    # -- Step 0: Get user input --
+    user_input = get_user_input()
+    position = user_input["position"]
+    description = user_input["description"]
+    city = user_input["city"]
+    work_type = user_input["work_type"]
 
-    # Normalize local scraper columns to match our standard format
-    local_jobs_list = []
-    if not local_jobs_df.empty:
-        # Standardize indeed/linkedin/google columns
-        # Map: site_name -> site, company_name -> company, location -> location, date_posted -> date_posted, job_url -> job_url
-        for _, row in local_jobs_df.iterrows():
-            local_jobs_list.append({
-                "site": str(row.get("site", "scraper")),
-                "title": str(row.get("title", "")),
-                "company": str(row.get("company", "")),
-                "location": str(row.get("location", "Lahore, Pakistan")),
-                "date_posted": str(row.get("date_posted", "")),
-                "job_url": str(row.get("job_url", "")),
-                "is_remote": bool(row.get("is_remote", False))
-            })
+    # -- Step 1: Build keyword plan --
+    _section(1, "Building smart search queries...")
+    plan = build_keyword_plan(position, description)
 
-    # 2. Query Free Remote Job APIs (Himalayas & Remotive) specifically for AI/ML/Software Internships
-    print("\n2. Fetching from Free Public Remote Job APIs (Himalayas & Remotive)...")
-    api_jobs = []
-    
-    # Query for AI and ML internships
-    api_jobs += fetch_himalayas_jobs("AI intern")
-    api_jobs += fetch_himalayas_jobs("machine learning intern")
-    api_jobs += fetch_remotive_jobs("AI intern")
-    api_jobs += fetch_remotive_jobs("machine learning intern")
-    
-    # 3. Combine and filter all jobs
-    print("\n3. Combining and filtering all listings...")
-    all_jobs = local_jobs_list + api_jobs
-    
-    if not all_jobs:
-        print("No jobs found across any platform or API.")
-        return
-        
-    df = pd.DataFrame(all_jobs)
-    
+    print(f"  Position:        {position}")
+    print(f"  Description:     {description or '(none)'}")
+    print(f"  City:            {city or 'Any / Worldwide'}")
+    print(f"  Work type:       {work_type}")
+    print(f"  Search queries:  {len(plan.search_queries)}")
+    for i, q in enumerate(plan.search_queries[:8], 1):
+        print(f"    {i}. {q}")
+    if len(plan.search_queries) > 8:
+        print(f"    ... +{len(plan.search_queries) - 8} more")
+    print(f"  Must-have kws:   {', '.join(plan.must_have[:10])}")
+    print(f"  Negative kws:    {', '.join(plan.negative[:8])}")
+
+    # -- Step 2: Scrape job boards (JobSpy) --
+    _section(2, "Scraping job boards (Indeed, LinkedIn, Google, Glassdoor)...")
+    jobspy_jobs = scrape_jobspy_boards(
+        queries=plan.search_queries,
+        city=city,
+        work_type=work_type,
+        hours_old=48,
+    )
+
+    # -- Step 3: Scrape free APIs --
+    _section(3, "Scraping free remote-job APIs (Himalayas, Remotive, Arbeitnow, RemoteOK)...")
+    api_jobs = fetch_all_api_jobs(
+        queries=plan.search_queries,
+        hours_old=48,
+    )
+
+    # -- Step 4: Combine --
+    _section(4, "Combining and deduplicating...")
+    all_jobs = jobspy_jobs + api_jobs
+
     # Deduplicate by URL
-    df = df.drop_duplicates(subset=["job_url"])
-    
-    # Convert title to lowercase for robust pandas filtering
-    df['title_lower'] = df['title'].str.lower()
-    
-    # Filter for AI/ML keywords AND Internship keywords to ensure high relevance
-    ai_keywords = ['ai', 'ml', 'machine learning', 'artificial intelligence', 'data science', 'deep learning', 'nlp', 'computer vision']
-    intern_keywords = ['intern', 'internship', 'trainee', 'fresh', 'student', 'co-op']
-    
-    is_ai = df['title_lower'].apply(lambda x: any(kw in str(x) for kw in ai_keywords))
-    is_intern = df['title_lower'].apply(lambda x: any(kw in str(x) for kw in intern_keywords))
-    
-    # Filter: Keep if it matches both AI/ML AND is an Internship
-    final_df = df[is_ai & is_intern].copy()
-    
-    # Remove our temporary lowercase column
-    final_df = final_df.drop(columns=['title_lower'])
-    
-    print(f"\n=========================================================================")
-    print(f"   SCRAPING COMPLETED: Surfaced {len(final_df)} highly relevant AI Internships!")
-    print(f"=========================================================================")
-    
-    if not final_df.empty:
-        # Sort by date posted (newest first)
-        final_df = final_df.sort_values(by="date_posted", ascending=False)
-        
-        # Preview Results
-        print(final_df[['site', 'title', 'company', 'location', 'date_posted']].head(20))
-        
-        # Save to unified CSV file
-        output_file = "ai_internships_lahore.csv"
-        final_df.to_csv(output_file, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
-        print(f"\n[SUCCESS] Exported all {len(final_df)} clean listings to: {output_file}")
-    else:
-        print("No strict AI/ML internships were found in this run.")
-        print("Tip: You can expand your configuration in search_jobs.py to include wider tech terms.")
+    seen: set[str] = set()
+    unique_jobs: list[dict] = []
+    for j in all_jobs:
+        url = j.get("job_url", "")
+        if url and url not in seen:
+            seen.add(url)
+            unique_jobs.append(j)
+
+    print(f"  Total scraped:   {len(all_jobs)}")
+    print(f"  After dedup:     {len(unique_jobs)}")
+
+    if not unique_jobs:
+        print("\n  WARNING: No jobs found. Try broader search terms or different city.")
+        return
+
+    # -- Step 5: Apply work-type filter --
+    if work_type == "remote":
+        unique_jobs = [j for j in unique_jobs if j.get("is_remote")]
+        print(f"  After remote filter: {len(unique_jobs)}")
+    elif work_type == "onsite":
+        unique_jobs = [j for j in unique_jobs if not j.get("is_remote")]
+        print(f"  After onsite filter: {len(unique_jobs)}")
+
+    if not unique_jobs:
+        print("\n  WARNING: No jobs left after work-type filter. Try 'any' for all types.")
+        return
+
+    # -- Step 6: Relevance scoring + filtering --
+    _section(5, "Scoring relevance & filtering out junk...")
+    scored = filter_jobs(unique_jobs, plan, threshold=35)
+
+    if not scored:
+        print("\n  WARNING: No jobs passed the relevance filter.")
+        print("  Tip: Try a broader description or different keywords.")
+        return
+
+    # -- Step 7: Build final DataFrame --
+    _section(6, "Building final results...")
+
+    rows = []
+    for sj in scored:
+        j = sj.job
+        rows.append({
+            "relevance_score": sj.score,
+            "site": j.get("site", ""),
+            "title": j.get("title", ""),
+            "company": j.get("company", ""),
+            "location": j.get("location", ""),
+            "date_posted": j.get("date_posted", ""),
+            "job_url": j.get("job_url", ""),
+            "is_remote": j.get("is_remote", False),
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Sort by relevance score descending, then date descending
+    df = df.sort_values(by=["relevance_score", "date_posted"], ascending=[False, False]).reset_index(drop=True)
+
+    # -- Step 8: Display & Export --
+    _header("RESULTS")
+
+    # Summary per source
+    source_counts = df["site"].value_counts()
+    print("\n  Results by source:")
+    for source, count in source_counts.items():
+        print(f"     - {source}: {count}")
+
+    # Top results preview
+    print(f"\n  Top {min(20, len(df))} results:\n")
+    preview_cols = ["relevance_score", "title", "company", "site"]
+    print(df[preview_cols].head(20).to_string(index=True))
+
+    # Export
+    safe_position = re.sub(r"[^a-zA-Z0-9]+", "_", position).strip("_").lower()
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    output_file = f"{safe_position}_{date_str}.csv"
+
+    df.to_csv(output_file, index=False, quoting=csv.QUOTE_NONNUMERIC, escapechar="\\")
+
+    print(f"\n  EXPORTED {len(df)} high-quality results to: {output_file}")
+    print(f"  All results scored >= 35 relevance (out of 100)")
+    print()
+
 
 if __name__ == "__main__":
     main()
