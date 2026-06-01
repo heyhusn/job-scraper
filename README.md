@@ -15,28 +15,30 @@ This scraper integrates standard browser scraping engines and modern public job 
 
 ```mermaid
 graph TD
-    A[Start Scraper] --> B[Interactive User Prompts]
-    B -->|Position, Description, City, Work Type| C[Keyword Engine]
-    
-    C -->|Generate Smart Queries| D[1. JobSpy Boards]
-    C -->|Generate Smart Queries| E[2. Free Remote APIs]
-    
-    D -->|Indeed, LinkedIn, Google, Glassdoor| F[Combine All Listings]
-    E -->|Himalayas, Remotive, Arbeitnow, RemoteOK| F
-    
-    F --> G[Deduplicate by URL]
-    G --> H[Relevance Engine]
-    
-    H -->|Layer 1: Domain/Role Title Match| I[Hard Filter]
-    I -->|Layer 2: Negative Keyword Match| J[Reject Junk]
-    J -->|Layer 3: Title/Desc Density Scoring| K[Relevance Score 0-100]
-    
-    K --> L[Threshold Filter >= 35]
-    L --> M[Sort by Score & Date]
-    M --> N[Export to CSV]
-```
 
----
+A["Start Scraper"] --> B["Interactive User Prompts"]
+
+B --> C["Position, Description, City, Work Type, Keyword Engine"]
+
+C --> D["JobSpy Boards"]
+C --> E["Free Remote APIs"]
+
+D --> F["Combine All Listings"]
+E --> F
+
+F --> G["Deduplicate by URL"]
+G --> H["Relevance Engine"]
+
+H --> I["Layer 1: Domain and Role Title Match"]
+I --> J["Layer 2: Negative Keyword Match"]
+J --> K["Layer 3: Description Density Scoring"]
+
+K --> L["Relevance Score: 0-100"]
+
+L --> M["Threshold Filter >= 35"]
+M --> N["Sort by Score and Date"]
+N --> O["Export to CSV"]
+```
 
 ## ✨ Features
 
